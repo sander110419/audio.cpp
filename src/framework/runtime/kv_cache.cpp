@@ -170,19 +170,32 @@ void TransformerKVCache::import_state(const TransformerKVState & state) {
         }
         if (prefix_only) {
             // Prefix rows are contiguous floats at offset 0 in the cache
-            // tensors ({1, cache_steps, heads, dim} dense layout).
-            if (keep_elems == 0) {
-                continue;
-            }
+            // tensors ({1, cache_steps, heads, dim} dense layout). The tail
+            // beyond the valid prefix is zeroed as well: stale finite values
+            // left by a previous request are masked from the attention result,
+            // but zeroing keeps every byte of the cache identical between
+            // identical requests, which measurably stabilizes the draw
+            // (first-use vs repeat outputs otherwise differ).
             if (cache.key_tensor.type != GGML_TYPE_F32 ||
                 cache.value_tensor.type != GGML_TYPE_F32) {
                 throw std::runtime_error(
                     "TransformerKVCache import_prefix_only requires f32 cache tensors");
             }
-            ggml_backend_tensor_set(cache.key_tensor.tensor, source.key.data(), 0,
-                                    keep_elems * sizeof(float));
-            ggml_backend_tensor_set(cache.value_tensor.tensor, source.value.data(), 0,
-                                    keep_elems * sizeof(float));
+            if (keep_elems > 0) {
+                ggml_backend_tensor_set(cache.key_tensor.tensor, source.key.data(), 0,
+                                        keep_elems * sizeof(float));
+                ggml_backend_tensor_set(cache.value_tensor.tensor, source.value.data(), 0,
+                                        keep_elems * sizeof(float));
+            }
+            const size_t cache_elems = static_cast<size_t>(cache_steps_ * step_elems_);
+            if (keep_elems < cache_elems) {
+                ggml_backend_tensor_memset(cache.key_tensor.tensor, 0,
+                                           keep_elems * sizeof(float),
+                                           (cache_elems - keep_elems) * sizeof(float));
+                ggml_backend_tensor_memset(cache.value_tensor.tensor, 0,
+                                           keep_elems * sizeof(float),
+                                           (cache_elems - keep_elems) * sizeof(float));
+            }
             continue;
         }
         const size_t cache_elems = static_cast<size_t>(cache_steps_ * step_elems_);

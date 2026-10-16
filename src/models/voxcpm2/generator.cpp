@@ -1782,7 +1782,6 @@ private:
     residual_lm_.import_state(prefill_output.residual_state);
     std::vector<float> lm_hidden = prefill_output.lm_hidden;
     std::vector<float> residual_hidden = prefill_output.residual_hidden;
-
     VoxCPM2Result result;
     std::vector<const PrefillRow *> context_rows;
     for (auto it = prefill.rows.rbegin(); it != prefill.rows.rend(); ++it) {
@@ -1818,7 +1817,7 @@ private:
       const auto patch = cfm_.generate_patch(
           mu, prefix_cond, options.num_inference_steps, options.guidance_scale,
           options.seed, patch_noise_start, options.cfm_noise_file);
-      patch_noise_start += static_cast<uint64_t>(patch_elems);
+     patch_noise_start += static_cast<uint64_t>(patch_elems);
       append_patch(result.generated_features, patch, patch_elems);
       ++result.generated_patches;
       append_patch(result.decode_features, patch, patch_elems);

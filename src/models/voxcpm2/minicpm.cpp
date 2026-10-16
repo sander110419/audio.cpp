@@ -686,9 +686,9 @@ minicpm_prefill_layer(engine::core::ModuleBuildContext &ctx,
                 .build(ctx, hidden, layer.up_proj);
   auto gated = engine::modules::MulModule{}.build(ctx, gate, up);
   auto ff = engine::modules::LinearModule(
-                binding::linear_config(config.intermediate_size,
-                                       config.hidden_size, false))
-                .build(ctx, gated, layer.down_proj);
+                  binding::linear_config(config.intermediate_size,
+                                         config.hidden_size, false))
+                  .build(ctx, gated, layer.down_proj);
   auto output = add.build(
       ctx, x,
       scale_tensor(ctx, ff,
@@ -736,21 +736,53 @@ public:
         static_cast<int64_t>(input.audio_mask.size()) != input.steps) {
       throw std::runtime_error("VoxCPM2 prompt prefill mask size mismatch");
     }
-    // Use a per-length cached graph. Rebuilding a fresh ggml graph for a new
-    // length changes allocator layout just enough to perturb ulp-level numerics,
-    // which the autoregressive loop amplifies into a visibly different draw
-    // (different pacing/stop point). Reusing the warm graph per length keeps
-    // repeated requests of the same length reproducible.
-    PrefillGraph &g = graph_for(input.steps);
-    ggml_backend_tensor_set(g.input_embeddings, input.input_embeddings.data(), 0,
-                            input.input_embeddings.size() * sizeof(float));
-    ggml_backend_tensor_set(g.current_embeddings,
-                            input.current_embeddings.data(), 0,
-                            input.current_embeddings.size() * sizeof(float));
-    ggml_backend_tensor_set(g.text_mask, input.text_mask.data(), 0,
-                            input.text_mask.size() * sizeof(float));
-    ggml_backend_tensor_set(g.audio_mask, input.audio_mask.data(), 0,
-                            input.audio_mask.size() * sizeof(float));
+    // Pick the smallest fixed bucket that fits; one graph per bucket per
+    // server lifetime (escape hatch: exact-size graph beyond the ladder).
+    // Padded prefill keeps every request on a warm, already-seen layout —
+    // per-length graph rebuilds measurably re-rolled the autoregressive draw.
+    PrefillGraph &g = graph_for(bucket_for(input.steps));
+    const int64_t cap = g.steps;
+    const int64_t real = input.steps;
+    // Zero the compute arena before uploading: any leftover-sensitive read
+    // inside the graph then sees a constant zero baseline instead of the
+    // previous compute's intermediates, so identical inputs give identical
+    // outputs regardless of request history.
+    if (g.arena_buffer != nullptr) {
+      ggml_backend_buffer_clear(g.arena_buffer, 0);
+      // positions live in the arena: re-upload after clearing.
+      std::vector<int32_t> position_ids(static_cast<size_t>(cap), 0);
+      for (int64_t i = 0; i < cap; ++i) {
+        position_ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+      }
+      ggml_backend_tensor_set(g.positions, position_ids.data(), 0,
+                              position_ids.size() * sizeof(int32_t));
+    }
+    auto upload_padded = [&](ggml_tensor *t, const std::vector<float> &data) {
+      ggml_backend_tensor_set(t, data.data(), 0,
+                              data.size() * sizeof(float));
+      const size_t tail = (static_cast<size_t>(cap) * hidden_size - data.size()) *
+                          sizeof(float);
+      if (tail > 0) {
+        ggml_backend_tensor_memset(t, 0, data.size() * sizeof(float), tail);
+      }
+    };
+    upload_padded(g.input_embeddings, input.input_embeddings);
+    upload_padded(g.current_embeddings, input.current_embeddings);
+    auto upload_padded_mask = [&](ggml_tensor *t, const std::vector<float> &data) {
+      ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+      const size_t tail =
+          (static_cast<size_t>(cap) - data.size()) * sizeof(float);
+      if (tail > 0) {
+        ggml_backend_tensor_memset(t, 0, data.size() * sizeof(float), tail);
+      }
+    };
+    upload_padded_mask(g.text_mask, input.text_mask);
+    upload_padded_mask(g.audio_mask, input.audio_mask);
+    // One-hot picker for the last REAL row (pad rows sit at the tail and are
+    // causally invisible, but the output row index varies per request).
+    std::vector<float> pick(static_cast<size_t>(cap), 0.0F);
+    pick[static_cast<size_t>(real - 1)] = 1.0F;
+    ggml_backend_tensor_set(g.pick, pick.data(), 0, pick.size() * sizeof(float));
     engine::core::set_backend_threads(weights_->backend(), weights_->threads());
     const ggml_status status =
         engine::core::compute_backend_graph(weights_->backend(), g.graph);
@@ -770,13 +802,13 @@ public:
     output.base_state = read_state(g.base_keys, g.base_values,
                                    config.lm.num_key_value_heads *
                                        head_dim(config.lm),
-                                   g.steps);
+                                   real);
     output.residual_state = read_state(g.residual_keys, g.residual_values,
                                        config.residual_lm_num_layers > 0
                                            ? config.lm.num_key_value_heads *
                                                  head_dim(config.lm)
                                            : 0,
-                                       g.steps);
+                                       real);
     return output;
   }
 
@@ -793,6 +825,7 @@ private:
     ggml_tensor *text_mask = nullptr;
     ggml_tensor *audio_mask = nullptr;
     ggml_tensor *positions = nullptr;
+    ggml_tensor *pick = nullptr;
     ggml_tensor *lm_hidden_output = nullptr;
     ggml_tensor *residual_hidden_output = nullptr;
     std::vector<ggml_tensor *> base_keys;
@@ -801,6 +834,7 @@ private:
     std::vector<ggml_tensor *> residual_values;
     ggml_cgraph *graph = nullptr;
     ggml_gallocr_t gallocr = nullptr;
+    ggml_backend_buffer_t arena_buffer = nullptr;  // cleared before each compute
 
     ~PrefillGraph() {
       if (graph != nullptr) {
@@ -836,7 +870,18 @@ private:
     return state;
   }
 
-  // Front of graphs_ is the active/most-recently-used length.
+  // Front of graphs_ is the active/most-recently-used bucket.
+  static int64_t bucket_for(int64_t steps) {
+    // Few fixed layouts per server lifetime; pad up to the smallest fit.
+    static const int64_t kBuckets[] = {256, 512, 1024};
+    for (const int64_t bucket : kBuckets) {
+      if (steps <= bucket) {
+        return bucket;
+      }
+    }
+    return steps;  // escape hatch: exact-size graph beyond the ladder
+  }
+
   PrefillGraph &graph_for(int64_t steps) {
     for (auto it = graphs_.begin(); it != graphs_.end(); ++it) {
       if ((*it)->steps == steps) {
@@ -889,6 +934,18 @@ private:
     auto positions = engine::core::wrap_tensor(
         g->positions, engine::core::TensorShape::from_dims({steps}),
         GGML_TYPE_I32);
+    // Protect the input tensors from gallocr arena reuse: unmarked leaf
+    // tensors are pool candidates, and an input read late in the graph
+    // (current_embeddings enters the residual concat after all layers) can
+    // otherwise read arena memory an intermediate overwrote mid-compute.
+    ggml_set_input(g->input_embeddings);
+    ggml_set_input(g->current_embeddings);
+    ggml_set_input(g->text_mask);
+    ggml_set_input(g->audio_mask);
+    ggml_set_input(g->positions);
+    // One-hot picker for the (variable) last real row; uploaded per request.
+    g->pick = ggml_new_tensor_1d(raw_ctx, GGML_TYPE_F32, steps);
+    ggml_set_input(g->pick);
     auto base_hidden = input_embeddings;
     for (const auto &layer : model_weights.base_lm.layers) {
       auto layer_out = minicpm_prefill_layer(
@@ -968,18 +1025,31 @@ private:
                           .build(ctx, residual_hidden,
                                  model_weights.residual_lm.norm);
 
-    auto last_lm = engine::modules::SliceModule({1, steps - 1, 1})
-                       .build(ctx, lm_hidden);
-    last_lm = engine::core::reshape_tensor(
-        ctx, ensure_contiguous(ctx, last_lm),
-        engine::core::TensorShape::from_dims({config.lm.hidden_size}));
-    g->lm_hidden_output = last_lm.tensor;
-    auto last_residual = engine::modules::SliceModule({1, steps - 1, 1})
-                             .build(ctx, residual_hidden);
-    last_residual = engine::core::reshape_tensor(
-        ctx, ensure_contiguous(ctx, last_residual),
-        engine::core::TensorShape::from_dims({config.lm.hidden_size}));
-    g->residual_hidden_output = last_residual.tensor;
+    auto last_row = [&](engine::core::TensorValue seq) {
+      // Extract row (real-1) without a baked-in index: multiply by the
+      // per-request one-hot pick vector (uploaded per run) and sum the row
+      // axis. Exact in f32 (x*1 plus zeros).
+      auto pick3 = engine::core::wrap_tensor(
+          ggml_reshape_3d(raw_ctx, g->pick, 1, steps, 1),
+          engine::core::TensorShape::from_dims({1, steps, 1}), GGML_TYPE_F32);
+      auto masked = engine::core::wrap_tensor(
+          ggml_mul(raw_ctx, seq.tensor, pick3.tensor), seq.shape, GGML_TYPE_F32);
+      // ggml_sum_rows sums ne[0]; permute the row axis to the front first.
+      auto perm = engine::core::wrap_tensor(
+          ggml_permute(raw_ctx, masked.tensor, 1, 0, 2, 3),
+          engine::core::TensorShape::from_dims({1, seq.shape.dims[2],
+                                                seq.shape.dims[1]}),
+          GGML_TYPE_F32);
+      auto summed =
+          ggml_sum_rows(raw_ctx, ensure_contiguous(ctx, perm).tensor);
+      auto flat =
+          ggml_reshape_1d(raw_ctx, summed, config.lm.hidden_size);
+      return engine::core::wrap_tensor(
+          flat, engine::core::TensorShape::from_dims({config.lm.hidden_size}),
+          GGML_TYPE_F32);
+    };
+    g->lm_hidden_output = last_row(lm_hidden).tensor;
+    g->residual_hidden_output = last_row(residual_hidden).tensor;
     ggml_set_output(g->lm_hidden_output);
     ggml_set_output(g->residual_hidden_output);
     g->graph = ggml_new_graph_custom(raw_ctx, kDefaultGraphNodes, false);
@@ -1004,12 +1074,52 @@ private:
       throw std::runtime_error(
           "failed to allocate VoxCPM2 prompt prefill graph");
     }
+    // Find the compute arena's buffer for the per-request zeroing in run().
+    for (ggml_tensor *t_ = ggml_get_first_tensor(raw_ctx); t_ != nullptr;
+         t_ = ggml_get_next_tensor(raw_ctx, t_)) {
+      if (t_->op != GGML_OP_NONE && t_->buffer != nullptr) {
+        g->arena_buffer = t_->buffer;
+        break;
+      }
+    }
     std::vector<int32_t> position_ids(static_cast<size_t>(steps), 0);
     for (int64_t i = 0; i < steps; ++i) {
       position_ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
     }
     ggml_backend_tensor_set(g->positions, position_ids.data(), 0,
                             position_ids.size() * sizeof(int32_t));
+    // Warm-up compute at build: the very first compute on a fresh graph can
+    // still differ mildly (kernel/pool first-use effects outside the arena);
+    // absorb it here so the first real request matches all later ones.
+    if (g->arena_buffer != nullptr) {
+      ggml_backend_buffer_clear(g->arena_buffer, 0);
+      ggml_backend_tensor_set(g->positions, position_ids.data(), 0,
+                              position_ids.size() * sizeof(int32_t));
+    }
+    {
+      std::vector<float> zeros(
+          static_cast<size_t>(steps * config.lm.hidden_size), 0.0F);
+      std::vector<float> zero_mask(static_cast<size_t>(steps), 0.0F);
+      std::vector<float> zero_pick(static_cast<size_t>(steps), 0.0F);
+      ggml_backend_tensor_set(g->input_embeddings, zeros.data(), 0,
+                              zeros.size() * sizeof(float));
+      ggml_backend_tensor_set(g->current_embeddings, zeros.data(), 0,
+                              zeros.size() * sizeof(float));
+      ggml_backend_tensor_set(g->text_mask, zero_mask.data(), 0,
+                              zero_mask.size() * sizeof(float));
+      ggml_backend_tensor_set(g->audio_mask, zero_mask.data(), 0,
+                              zero_mask.size() * sizeof(float));
+      ggml_backend_tensor_set(g->pick, zero_pick.data(), 0,
+                              zero_pick.size() * sizeof(float));
+      engine::core::set_backend_threads(weights_->backend(),
+                                        weights_->threads());
+      if (engine::core::compute_backend_graph(weights_->backend(), g->graph) !=
+          GGML_STATUS_SUCCESS) {
+        throw std::runtime_error(
+            "VoxCPM2 prompt prefill warm-up compute failed");
+      }
+      ggml_backend_synchronize(weights_->backend());
+    }
     return g;
   }
 
